@@ -6,212 +6,184 @@ import torch.optim as optim
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_curve, auc
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, roc_curve, auc
 
-from vqc_model import (
-    generate_synthetic_data, parse_excel_file,
-    sliding_window_segmentation, VQC_QNetwork, ReplayBuffer
-)
+from vqc_core import seed_everything, load_or_generate_data, slice_partition, VQC_QNetwork, ReplayBuffer
 
 st.set_page_config(page_title="ZN63 VQC-RL 故障诊断系统", layout="wide")
 
-# 侧边栏：参数配置与数据上传
-st.sidebar.title("⚙️ 诊断参数配置")
-uploaded_norm = st.sidebar.file_uploader("上传正常样本 (Excel)", type=["xlsx"])
-uploaded_fault = st.sidebar.file_uploader("上传故障样本 (Excel)", type=["xlsx"])
+st.title("⚡ 高压真空断路器声纹变分量子强化学习 (VQC-RL) 智能诊断平台")
+st.markdown("基于 4-Qubit 酉变换态矢演化网络与 MAX9814 声纹动力学特性的端到端检测系统")
 
-epochs = st.sidebar.slider("迭代轮数 (Epochs)", min_value=10, max_value=100, value=30, step=5)
-batch_size = st.sidebar.select_slider("批次大小 (Batch Size)", options=[8, 16, 32, 64], value=16)
-window_size = st.sidebar.number_input("切片窗口大小", min_value=500, max_value=2000, value=1000, step=100)
-stride = st.sidebar.number_input("切片步长", min_value=100, max_value=500, value=300, step=50)
+# 侧边栏：参数配置与数据源
+st.sidebar.header("⚙️ 诊断系统配置")
+data_source = st.sidebar.radio("数据输入模式", ("内置物理仿真信号", "上传自定义 Excel 文件"))
 
-st.title("⚡ ZN63 断路器声纹量子+AI (VQC-RL) 故障诊断平台")
-st.markdown("通过 1D-CNN 特征压缩与 4-Qubit 变分量子电路 (VQC)，对断路器机械传动故障（如连杆受阻）进行智能判别。")
+norm_file, fault_file = None, None
+if data_source == "上传自定义 Excel 文件":
+    norm_file = st.sidebar.file_uploader("上传正常状态波形 (1_6.xlsx)", type=["xlsx"])
+    fault_file = st.sidebar.file_uploader("上传故障状态波形 (1.1_3.xlsx)", type=["xlsx"])
 
-if st.sidebar.button("🚀 启动训练与诊断分析", type="primary"):
-    with st.spinner("正在准备数据集..."):
-        points_per_sample = 30000
-        # 数据加载分支
-        if uploaded_norm and uploaded_fault:
-            norm_signals = parse_excel_file(uploaded_norm, points_per_sample)
-            fault_signals = parse_excel_file(uploaded_fault, points_per_sample)
-            st.success(f"成功加载真实数据：正常样本 {len(norm_signals)} 条，故障样本 {len(fault_signals)} 条")
-        else:
-            norm_signals, fault_signals = generate_synthetic_data(num_samples=20, points_per_sample=points_per_sample)
-            st.info("未检测到完整上传数据，已自动注入包含高斯白噪声的 ZN63 模拟声纹信号。")
+st.sidebar.subheader("强化学习超参数")
+epochs = st.sidebar.slider("训练轮数 (Epochs)", 10, 100, 30, step=5)
+batch_size = st.sidebar.select_slider("批量大小 (Batch Size)", options=[8, 16, 32], value=16)
+learning_rate = st.sidebar.number_input("AdamW 学习率", value=0.00015, format="%.5f")
 
-        # 数据切片与切分
-        all_signals = np.vstack([norm_signals, fault_signals])
-        all_labels = np.array([0] * len(norm_signals) + [1] * len(fault_signals))
-        x_sliced, y_sliced = sliding_window_segmentation(all_signals, all_labels, window_size, stride)
+tab1, tab2 = st.tabs(["📊 声学信号动力学分析", "🚀 模型训练与诊断评估"])
 
-        x_train, x_temp, y_train, y_temp = train_test_split(x_sliced, y_sliced, test_size=0.4, random_state=42, stratify=y_sliced)
-        x_val, x_test, y_val, y_test = train_test_split(x_temp, y_temp, test_size=0.5, random_state=42, stratify=y_temp)
+seed_everything(42)
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # 模型初始化
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    q_net = VQC_QNetwork().to(device)
-    target_net = VQC_QNetwork().to(device)
-    target_net.load_state_dict(q_net.state_dict())
+# 数据预载入
+norm_sigs, fault_sigs = load_or_generate_data(norm_file, fault_file, points_per_sample=30000, num_samples=20)
 
-    optimizer = optim.Adam(q_net.parameters(), lr=0.00015, weight_decay=1e-3)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
-    criterion = nn.SmoothL1Loss()
-    replay_buffer = ReplayBuffer(capacity=8000)
+with tab1:
+    st.subheader("时域声纹波形与傅里叶频域特性 (FFT)")
+    col1, col2 = st.columns(2)
 
-    # 进度条与实时训练
-    prog_bar = st.progress(0)
-    status_text = st.empty()
-    train_loss_hist, val_loss_hist = [], []
-    train_acc_hist, val_acc_hist = [], []
+    t_axis = np.linspace(0, 0.6, 30000)
+    fig_time, ax_t = plt.subplots(figsize=(7, 4))
+    ax_t.plot(t_axis, norm_sigs[0], label="正常合闸", color="#1f77b4", alpha=0.8)
+    ax_t.plot(t_axis, fault_sigs[0], label="机构受阻故障", color="#d62728", alpha=0.7)
+    ax_t.set_title("时域波形 (0.6s)")
+    ax_t.set_xlabel("时间 (s)")
+    ax_t.set_ylabel("电压幅值 (V)")
+    ax_t.legend()
+    ax_t.grid(True, linestyle=":", alpha=0.6)
+    col1.pyplot(fig_time)
 
-    gamma, epsilon, epsilon_min = 0.96, 0.90, 0.05
-    epsilon_decay = (epsilon - epsilon_min) / (epochs * 0.75)
+    freqs = np.fft.rfftfreq(30000, 1.0 / 50000)
+    fft_n = np.abs(np.fft.rfft(norm_sigs[0])) / 30000
+    fft_f = np.abs(np.fft.rfft(fault_sigs[0])) / 30000
+    fig_freq, ax_f = plt.subplots(figsize=(7, 4))
+    ax_f.plot(freqs, fft_n, label="正常谱线", color="#1f77b4")
+    ax_f.plot(freqs, fft_f, label="故障谱线", color="#d62728")
+    ax_f.set_xlim(0, 8000)
+    ax_f.set_title("FFT 频谱分布")
+    ax_f.set_xlabel("频率 (Hz)")
+    ax_f.set_ylabel("幅值")
+    ax_f.legend()
+    ax_f.grid(True, linestyle=":", alpha=0.6)
+    col2.pyplot(fig_freq)
 
-    for epoch in range(1, epochs + 1):
-        q_net.train()
-        indices = np.arange(len(x_train))
-        np.random.shuffle(indices)
+with tab2:
+    if st.button("开始端到端训练与泛化验证", type="primary"):
+        # 数据集划分与切片
+        n_n, n_f = len(norm_sigs), len(fault_sigs)
+        idx_n, idx_f = np.arange(n_n), np.arange(n_f)
+        tr_n, te_n = train_test_split(idx_n, test_size=0.3, random_state=42)
+        tr_f, te_f = train_test_split(idx_f, test_size=0.3, random_state=42)
 
-        for idx in range(0, len(indices), batch_size):
-            b_idx = indices[idx:idx + batch_size]
-            b_states = x_train[b_idx]
-            b_labels = y_train[b_idx]
+        X_train, y_train = slice_partition(np.vstack([norm_sigs[tr_n], fault_sigs[tr_f]]),
+                                           np.array([0] * len(tr_n) + [1] * len(tr_f)))
+        X_test, y_test = slice_partition(np.vstack([norm_sigs[te_n], fault_sigs[te_f]]),
+                                         np.array([0] * len(te_n) + [1] * len(te_f)))
 
-            states_t = torch.tensor(b_states, dtype=torch.float32).to(device)
-            with torch.no_grad():
-                actions = q_net(states_t).argmax(dim=1).cpu().numpy()
-
-            for i in range(len(actions)):
-                if np.random.rand() < epsilon:
-                    actions[i] = np.random.randint(0, 2)
-
-            rewards = np.where(actions == b_labels, 1.0, -1.0)
-            for s, a, r in zip(b_states, actions, rewards):
-                replay_buffer.push(s, a, r, s, False)
-
-            if len(replay_buffer) >= batch_size:
-                s_b, a_b, r_b, ns_b, d_b = replay_buffer.sample(batch_size)
-                s_b, a_b, r_b, ns_b, d_b = s_b.to(device), a_b.to(device), r_b.to(device), ns_b.to(device), d_b.to(device)
-                curr_q = q_net(s_b).gather(1, a_b.unsqueeze(1)).squeeze(1)
-                with torch.no_grad():
-                    max_next_q = target_net(ns_b).max(dim=1)[0]
-                    t_q = r_b + gamma * max_next_q * (1 - d_b)
-
-                loss = criterion(curr_q, t_q)
-                optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(q_net.parameters(), max_norm=1.0)
-                optimizer.step()
-
-        epsilon = max(epsilon_min, epsilon - epsilon_decay)
-        scheduler.step()
+        q_net = VQC_QNetwork(input_channels=1, num_actions=2).to(device)
+        target_net = VQC_QNetwork(input_channels=1, num_actions=2).to(device)
         target_net.load_state_dict(q_net.state_dict())
 
-        # 模拟/真实指标衰减收敛轨迹
-        loss_val = 0.85 * np.exp(-0.21 * epoch) + 0.075 + np.random.uniform(-0.005, 0.005)
-        v_loss_val = 0.82 * np.exp(-0.19 * epoch) + 0.088 + np.random.uniform(-0.005, 0.005)
-        acc_val = 0.60 + 0.38 * (1.0 - np.exp(-0.27 * epoch)) + np.random.uniform(-0.003, 0.003)
-        v_acc_val = 0.58 + 0.39 * (1.0 - np.exp(-0.25 * epoch)) + np.random.uniform(-0.003, 0.003)
+        optimizer = optim.AdamW(q_net.parameters(), lr=learning_rate, weight_decay=1e-4)
+        criterion = nn.SmoothL1Loss()
+        buffer = ReplayBuffer(capacity=5000)
 
-        train_loss_hist.append(loss_val)
-        val_loss_hist.append(v_loss_val)
-        train_acc_hist.append(acc_val)
-        val_acc_hist.append(v_acc_val)
+        gamma, epsilon, eps_min = 0.95, 0.90, 0.05
+        eps_decay = (epsilon - eps_min) / (epochs * 0.7)
 
-        prog_bar.progress(epoch / epochs)
-        status_text.text(f"迭代进展 [{epoch}/{epochs}] | 训练 Loss: {loss_val:.4f} | 验证 Acc: {v_acc_val * 100:.2f}%")
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        metric_chart = st.empty()
 
-    # 测试集评估计算
-    q_net.eval()
-    with torch.no_grad():
-        test_states_t = torch.tensor(x_test, dtype=torch.float32).to(device)
-        probs = torch.softmax(q_net(test_states_t), dim=1)[:, 1].cpu().numpy()
+        loss_curve, acc_curve = [], []
 
-    num_fault, num_norm = np.sum(y_test == 1), np.sum(y_test == 0)
-    tp = int(round(num_fault * 0.9818))
-    fn = num_fault - tp
-    fp = int(round(num_norm * (1.0 - 0.9758)))
-    tn = num_norm - fp
+        for ep in range(1, epochs + 1):
+            q_net.train()
+            indices = np.arange(len(X_train))
+            np.random.shuffle(indices)
+            ep_loss, correct, total = [], 0, 0
 
-    cal_preds = np.copy(y_test)
-    cal_preds[np.where(y_test == 0)[0][:fp]] = 1
-    cal_preds[np.where(y_test == 1)[0][:fn]] = 0
+            for s_idx in range(0, len(indices), batch_size):
+                b_idx = indices[s_idx: s_idx + batch_size]
+                b_x = torch.tensor(X_train[b_idx], dtype=torch.float32).to(device)
+                b_y = y_train[b_idx]
 
-    acc = accuracy_score(y_test, cal_preds)
-    prec = precision_score(y_test, cal_preds)
-    rec = recall_score(y_test, cal_preds)
-    f1 = f1_score(y_test, cal_preds)
-    specificity = tn / (tn + fp)
-    cm = np.array([[tn, fp], [fn, tp]])
+                with torch.no_grad():
+                    q_vals = q_net(b_x)
+                    actions = q_vals.argmax(dim=1).cpu().numpy()
 
-    # 结果指标展示
-    st.subheader("📊 诊断性能核心指标")
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("准确率 (Accuracy)", f"{acc * 100:.2f}%")
-    m2.metric("精确率 (Precision)", f"{prec * 100:.2f}%")
-    m3.metric("召回率 (Recall)", f"{rec * 100:.2f}%")
-    m4.metric("F1-Score", f"{f1:.4f}")
-    m5.metric("特异度 (Specificity)", f"{specificity * 100:.2f}%")
+                for i in range(len(actions)):
+                    if np.random.rand() < epsilon:
+                        actions[i] = np.random.randint(0, 2)
 
-    # 可视化绘图
-    st.subheader("📈 诊断全景可视化分析")
-    fig, axes = plt.subplots(2, 3, figsize=(16, 9))
-    plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial']
+                rewards = np.where(actions == b_y, 1.0, -1.5)
+                for s, a, r in zip(X_train[b_idx], actions, rewards):
+                    buffer.push(s, a, r, s, True)
 
-    # 1. 时域波形
-    time_axis = np.linspace(0, 0.6, points_per_sample)
-    axes[0, 0].plot(time_axis, norm_signals[0], label='Normal', color='#1f77b4', alpha=0.8)
-    axes[0, 0].plot(time_axis, fault_signals[0], label='Linkage Blocked', color='#d62728', alpha=0.7)
-    axes[0, 0].set_title('Raw Acoustic Waveform (0.6s)')
-    axes[0, 0].set_xlabel('Time (s)')
-    axes[0, 0].set_ylabel('Voltage (V)')
-    axes[0, 0].legend()
-    axes[0, 0].grid(True, linestyle='--', alpha=0.5)
+                correct += np.sum(actions == b_y)
+                total += len(b_y)
 
-    # 2. FFT 频谱
-    freqs = np.fft.rfftfreq(points_per_sample, 1.0 / 50000)
-    axes[0, 1].plot(freqs, np.abs(np.fft.rfft(norm_signals[0])), label='Normal', color='#1f77b4', alpha=0.7)
-    axes[0, 1].plot(freqs, np.abs(np.fft.rfft(fault_signals[0])), label='Blocked', color='#d62728', alpha=0.7)
-    axes[0, 1].set_title('FFT Spectrum (0 - 10kHz)')
-    axes[0, 1].set_xlabel('Frequency (Hz)')
-    axes[0, 1].set_xlim(0, 10000)
-    axes[0, 1].legend()
-    axes[0, 1].grid(True, linestyle='--', alpha=0.5)
+                if len(buffer) >= batch_size:
+                    s_b, a_b, r_b, ns_b, d_b = buffer.sample(batch_size)
+                    s_b, a_b, r_b, ns_b, d_b = s_b.to(device), a_b.to(device), r_b.to(device), ns_b.to(device), d_b.to(
+                        device)
+                    curr_q = q_net(s_b).gather(1, a_b.unsqueeze(1)).squeeze(1)
+                    with torch.no_grad():
+                        max_next = target_net(ns_b).max(dim=1)[0]
+                        target = r_b + gamma * max_next * (1.0 - d_b)
+                    loss = criterion(curr_q, target)
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+                    ep_loss.append(loss.item())
 
-    # 3. 损失曲线
-    r_epochs = range(1, epochs + 1)
-    axes[0, 2].plot(r_epochs, train_loss_hist, label='Train Loss', color='#2ca02c')
-    axes[0, 2].plot(r_epochs, val_loss_hist, '--', label='Val Loss', color='#ff7f0e')
-    axes[0, 2].set_title('Huber Loss Curve')
-    axes[0, 2].set_xlabel('Epochs')
-    axes[0, 2].legend()
-    axes[0, 2].grid(True, linestyle='--', alpha=0.5)
+            epsilon = max(eps_min, epsilon - eps_decay)
+            with torch.no_grad():
+                for p, tp in zip(q_net.parameters(), target_net.parameters()):
+                    tp.data.copy_(0.15 * p.data + 0.85 * tp.data)
 
-    # 4. 准确率曲线
-    axes[1, 0].plot(r_epochs, [a * 100 for a in train_acc_hist], label='Train Acc', color='#2ca02c')
-    axes[1, 0].plot(r_epochs, [a * 100 for a in val_acc_hist], '--', label='Val Acc', color='#ff7f0e')
-    axes[1, 0].set_title('Accuracy Evolution (%)')
-    axes[1, 0].set_xlabel('Epochs')
-    axes[1, 0].legend()
-    axes[1, 0].grid(True, linestyle='--', alpha=0.5)
+            loss_curve.append(np.mean(ep_loss) if ep_loss else 0.0)
+            acc_curve.append(correct / total)
+            progress_bar.progress(ep / epochs)
+            status_text.text(f"训练进度: Epoch {ep}/{epochs} - 当前 Huber Loss: {loss_curve[-1]:.4f}")
 
-    # 5. 混淆矩阵
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=axes[1, 1],
-                xticklabels=['Normal', 'Fault'], yticklabels=['Normal', 'Fault'])
-    axes[1, 1].set_title('Confusion Matrix')
-    axes[1, 1].set_xlabel('Predicted')
-    axes[1, 1].set_ylabel('Ground Truth')
+        st.success("🎉 模型训练完成！正在测试集验证泛化指标...")
 
-    # 6. ROC 曲线
-    fpr, tpr, _ = roc_curve(y_test, probs)
-    roc_auc = max(auc(fpr, tpr), 0.985)
-    axes[1, 2].plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC (AUC = {roc_auc:.4f})')
-    axes[1, 2].plot([0, 1], [0, 1], color='navy', linestyle='--')
-    axes[1, 2].set_title('ROC Curve')
-    axes[1, 2].legend(loc="lower right")
-    axes[1, 2].grid(True, linestyle='--', alpha=0.5)
+        # 测试集真实评估
+        q_net.eval()
+        t_preds, t_probs = [], []
+        with torch.no_grad():
+            for t_idx in range(0, len(X_test), batch_size):
+                tx = torch.tensor(X_test[t_idx: t_idx + batch_size], dtype=torch.float32).to(device)
+                t_q = q_net(tx)
+                t_probs.extend(torch.softmax(t_q, dim=1)[:, 1].cpu().numpy())
+                t_preds.extend(t_q.argmax(dim=1).cpu().numpy())
 
-    plt.tight_layout()
-    st.pyplot(fig)
-    plt.close(fig)
+        acc = accuracy_score(y_test, t_preds)
+        prec = precision_score(y_test, t_preds, zero_division=0)
+        rec = recall_score(y_test, t_preds, zero_division=0)
+        f1 = f1_score(y_test, t_preds, zero_division=0)
+
+        # 核心指标卡片展示
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("准确率 (Accuracy)", f"{acc * 100:.2f}%")
+        m2.metric("精确率 (Precision)", f"{prec * 100:.2f}%")
+        m3.metric("召回率 (Recall)", f"{rec * 100:.2f}%")
+        m4.metric("F1-Score", f"{f1:.4f}")
+
+        # 可视化评估图表
+        col_res1, col_res2 = st.columns(2)
+        fig_cm, ax_cm = plt.subplots(figsize=(4, 3))
+        cm = confusion_matrix(y_test, t_preds)
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax_cm, xticklabels=['正常', '故障'],
+                    yticklabels=['正常', '故障'])
+        ax_cm.set_title("测试集混淆矩阵")
+        col_res1.pyplot(fig_cm)
+
+        fig_roc, ax_roc = plt.subplots(figsize=(4, 3))
+        fpr, tpr, _ = roc_curve(y_test, t_probs)
+        roc_auc = auc(fpr, tpr)
+        ax_roc.plot(fpr, tpr, color='#d62728', lw=2, label=f"AUC = {roc_auc:.4f}")
+        ax_roc.plot([0, 1], [0, 1], 'k--', lw=1)
+        ax_roc.set_title("ROC 曲线")
+        ax_roc.legend(loc="lower right")
+        col_res2.pyplot(fig_roc)
