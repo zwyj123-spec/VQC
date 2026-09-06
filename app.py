@@ -16,7 +16,7 @@ st.title("⚡ 高压真空断路器声纹变分量子强化学习 (VQC-RL) 智�
 st.markdown("基于 4-Qubit 酉变换态矢演化网络与 MAX9814 声纹动力学特性的端到端检测系统")
 
 # 侧边栏：参数配置与数据源
-st.sidebar.header("⚙️ 诊断系统配置")
+st.sidebar.header("巢湖学院")
 data_source = st.sidebar.radio("数据输入模式", ("内置物理仿真信号", "上传自定义 Excel 文件"))
 
 norm_file, fault_file = None, None
